@@ -55,9 +55,12 @@ func (h *Handler) messagesHandler(c *gin.Context) {
 
 	// Input token counting + prompt-cache simulation.
 	inputTokens := util.CountMessagesTokens(apiReq.Messages)
+	cacheCreation, cacheRead := util.RecordAnthropicCache(req)
 	promptHash := util.HashPrompt(messagesText(apiReq.Messages))
-	cacheCreation, cacheRead := util.RecordCache(promptHash, inputTokens)
-	cachedTokens := cacheRead
+	if cacheCreation == 0 && cacheRead == 0 {
+		// Fallback to prompt hash simulation if request has no explicit cache_control blocks
+		cacheCreation, cacheRead = util.RecordCache(promptHash, inputTokens)
+	}
 
 	translated, response, err := h.startDuckDuckGoRequest(apiReq)
 	if err != nil {
@@ -77,11 +80,10 @@ func (h *Handler) messagesHandler(c *gin.Context) {
 	}
 
 	// Cache breakdown is known before streaming; set before first flush.
-	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
-	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+	setCacheHeaders(c, promptHash, cacheCreation, cacheRead)
 
 	start := time.Now()
-	result := handleAnthropicStream(c, response.Body, req.Model, req.Stream, start, inputTokens, cachedTokens, effort)
+	result := handleAnthropicStream(c, response.Body, req.Model, req.Stream, start, inputTokens, cacheCreation, cacheRead, effort)
 
 	// Timing headers (only delivered for non-stream; for stream the same values
 	// live in the message_delta event).
@@ -93,13 +95,13 @@ func (h *Handler) messagesHandler(c *gin.Context) {
 	}
 
 	if !req.Stream {
-		c.JSON(200, buildAnthropicResponse(req.Model, result, inputTokens, cachedTokens, effort))
+		c.JSON(200, buildAnthropicResponse(req.Model, result, inputTokens, cacheCreation, cacheRead, effort))
 	}
 }
 
 // handleAnthropicStream reads DuckDuckGo's text SSE and emits Anthropic SSE events.
 // For non-stream it accumulates the text and returns the result.
-func handleAnthropicStream(c *gin.Context, body io.ReadCloser, model string, stream bool, start time.Time, inputTokens, cachedTokens int, effort string) anthropicStreamResult {
+func handleAnthropicStream(c *gin.Context, body io.ReadCloser, model string, stream bool, start time.Time, inputTokens, cacheCreation, cacheRead int, effort string) anthropicStreamResult {
 	defer body.Close()
 
 	reader := bufio.NewReader(body)
@@ -124,7 +126,11 @@ func handleAnthropicStream(c *gin.Context, body io.ReadCloser, model string, str
 				Role:    "assistant",
 				Model:   model,
 				Content: []anthropic.ContentBlock{},
-				Usage:   anthropic.AnthropicUsage{InputTokens: inputTokens},
+				Usage: anthropic.AnthropicUsage{
+					InputTokens:              inputTokens,
+					CacheCreationInputTokens: cacheCreation,
+					CacheReadInputTokens:     cacheRead,
+				},
 			},
 		})
 		writeEvent(c, "content_block_start", anthropic.ContentBlockStartEvent{
@@ -210,13 +216,12 @@ func writeEvent(c *gin.Context, eventType string, payload interface{}) {
 }
 
 // buildAnthropicResponse builds the non-stream MessagesResponse.
-func buildAnthropicResponse(model string, r anthropicStreamResult, inputTokens, cachedTokens int, effort string) anthropic.MessagesResponse {
+func buildAnthropicResponse(model string, r anthropicStreamResult, inputTokens, cacheCreation, cacheRead int, effort string) anthropic.MessagesResponse {
 	usage := anthropic.AnthropicUsage{
-		InputTokens:  inputTokens,
-		OutputTokens: r.outputTokens,
-	}
-	if cachedTokens > 0 {
-		usage.CacheReadInputTokens = cachedTokens
+		InputTokens:              inputTokens,
+		OutputTokens:             r.outputTokens,
+		CacheCreationInputTokens: cacheCreation,
+		CacheReadInputTokens:     cacheRead,
 	}
 	return anthropic.MessagesResponse{
 		ID:         "msg_" + util.RandomHexadecimalString(),

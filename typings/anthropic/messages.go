@@ -46,8 +46,9 @@ type ContentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
 	Content   json.RawMessage `json:"content,omitempty"`     // tool_result
 	IsError   bool            `json:"is_error,omitempty"`
-	Thinking  string          `json:"thinking,omitempty"` // thinking block
-	Signature string          `json:"signature,omitempty"`
+	Thinking     string          `json:"thinking,omitempty"` // thinking block
+	Signature    string          `json:"signature,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 // ImageSource describes a base64 image in Anthropic format.

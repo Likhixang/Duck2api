@@ -90,6 +90,7 @@ const cacheTTL = 5 * time.Minute
 
 type cacheEntry struct {
 	tokens    int
+	createdAt time.Time // when the entry was created (for Age header)
 	expiresAt time.Time
 }
 
@@ -119,8 +120,37 @@ func RecordCache(promptHash string, tokens int) (cacheCreation int, cacheRead in
 	if e, ok := cacheStore[promptHash]; ok && now.Before(e.expiresAt) {
 		return 0, e.tokens
 	}
-	cacheStore[promptHash] = cacheEntry{tokens: tokens, expiresAt: now.Add(cacheTTL)}
+	cacheStore[promptHash] = cacheEntry{tokens: tokens, createdAt: now, expiresAt: now.Add(cacheTTL)}
 	return tokens, 0
+}
+
+// CacheStatus reports whether a prompt hash is currently cached (HIT vs MISS)
+// and how many seconds ago the entry was created (for the Age header).
+// Returns (hit bool, ageSeconds int). ageSeconds is 0 when not hit.
+func CacheStatus(promptHash string) (hit bool, ageSeconds int) {
+	if promptHash == "" {
+		return false, 0
+	}
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	now := time.Now()
+	if e, ok := cacheStore[promptHash]; ok && now.Before(e.expiresAt) {
+		return true, int(now.Sub(e.createdAt).Seconds())
+	}
+	return false, 0
+}
+
+// CacheHeaders returns the standard HTTP cache headers so external
+// cache-statistics/monitoring software (Varnish, Squid, CDNs) can read them.
+//   - X-Cache: "HIT" or "MISS"
+//   - Age: <seconds> (omitted on MISS)
+func CacheHeaders(promptHash string) (xCache string, ageSeconds int) {
+	hit, age := CacheStatus(promptHash)
+	if hit {
+		return "HIT", age
+	}
+	return "MISS", 0
 }
 
 // HashPrompt builds a stable hash for prompt cache keying.

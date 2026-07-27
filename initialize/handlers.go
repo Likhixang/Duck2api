@@ -105,8 +105,7 @@ func (h *Handler) duckduckgo(c *gin.Context) {
 
 	// Cache breakdown is known before streaming starts, so set these headers
 	// before the first chunk is flushed (works for both stream and non-stream).
-	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
-	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+	setCacheHeaders(c, promptHash, cacheCreation, cacheRead)
 
 	result := duckgo.Handler(c, response, translated_request, original_request.Stream, stats)
 
@@ -144,6 +143,19 @@ func messagesText(messages []officialtypes.ApiMessage) string {
 	return sb.String()
 }
 
+// setCacheHeaders sets both the existing custom cache headers and the standard
+// HTTP cache headers (X-Cache / Age) that external cache-statistics software
+// (Varnish, Squid, CDNs, monitoring) can read.
+func setCacheHeaders(c *gin.Context, promptHash string, cacheCreation, cacheRead int) {
+	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
+	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+	xCache, age := util.CacheHeaders(promptHash)
+	c.Header("X-Cache", xCache)
+	if xCache == "HIT" {
+		c.Header("Age", fmt.Sprintf("%d", age))
+	}
+}
+
 func (h *Handler) responses(c *gin.Context) {
 	var responseRequest officialtypes.ResponseAPIRequest
 	err := c.BindJSON(&responseRequest)
@@ -173,6 +185,10 @@ func (h *Handler) responses(c *gin.Context) {
 	cacheCreation, cacheRead := util.RecordCache(promptHash, inputTokens)
 	cachedTokens := cacheRead
 
+	// Cache breakdown is known before streaming starts, so set these headers
+	// before the first chunk is flushed (works for both stream and non-stream).
+	setCacheHeaders(c, promptHash, cacheCreation, cacheRead)
+
 	translatedRequest, response, err := h.startDuckDuckGoRequest(chatRequest)
 	if err != nil {
 		c.JSON(500, gin.H{
@@ -189,8 +205,7 @@ func (h *Handler) responses(c *gin.Context) {
 	}
 
 	// Cache breakdown is known before streaming; set before first flush.
-	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
-	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+	setCacheHeaders(c, promptHash, cacheCreation, cacheRead)
 
 	start := time.Now()
 	stats := duckgo.HandlerStats{

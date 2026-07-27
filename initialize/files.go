@@ -392,8 +392,7 @@ func (h *Handler) chatWithFiles(c *gin.Context) {
 
 	// Cache breakdown is known before streaming starts, so set these headers
 	// before the first chunk is flushed (works for both stream and non-stream).
-	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
-	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+	setCacheHeaders(c, promptHash, cacheCreation, cacheRead)
 
 	result := duckgo.Handler(c, response, translated_request, req.Stream, stats)
 
