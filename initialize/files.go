@@ -5,11 +5,13 @@ import (
 	"aurora/httpclient/bogdanfinn"
 	"aurora/internal/duckgo"
 	officialtypes "aurora/typings/official"
+	"aurora/util"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -357,6 +359,18 @@ func (h *Handler) chatWithFiles(c *gin.Context) {
 	}
 
 	// Process as normal chat
+	effort := req.ReasoningEffort
+	if effort == "" {
+		effort = os.Getenv("CLAUDE_CODE_EFFORT_LEVEL")
+		req.ReasoningEffort = effort
+	}
+
+	// Input token counting + prompt-cache simulation (cache creation / hit).
+	inputTokens := util.CountMessagesTokens(req.Messages)
+	promptHash := util.HashPrompt(messagesText(req.Messages))
+	cacheCreation, cacheRead := util.RecordCache(promptHash, inputTokens)
+	cachedTokens := cacheRead
+
 	translated_request, response, err := h.startDuckDuckGoRequest(req.APIRequest)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -367,12 +381,41 @@ func (h *Handler) chatWithFiles(c *gin.Context) {
 	if duckgo.Handle_request_error(c, response) {
 		return
 	}
-	response_part := duckgo.Handler(c, response, translated_request, req.Stream)
+
+	start := time.Now()
+	stats := duckgo.HandlerStats{
+		Start:        start,
+		PromptTokens: inputTokens,
+		CachedTokens: cachedTokens,
+		Effort:       effort,
+	}
+
+	// Cache breakdown is known before streaming starts, so set these headers
+	// before the first chunk is flushed (works for both stream and non-stream).
+	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
+	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+
+	result := duckgo.Handler(c, response, translated_request, req.Stream, stats)
+
+	// Timing is only known after the stream completes. For non-stream this header
+	// is delivered; for stream the same values are in the final usage chunk.
+	c.Header("X-TTFT-Ms", fmt.Sprintf("%d", result.TTFTMs))
+	c.Header("X-Total-Time-Ms", fmt.Sprintf("%d", result.TotalMs))
+
 	if c.Writer.Status() != 200 {
 		return
 	}
 	if !req.Stream {
-		c.JSON(200, officialtypes.NewChatCompletionWithModel(response_part, translated_request.Model))
+		c.JSON(200, officialtypes.NewChatCompletionFull(
+			result.Text,
+			translated_request.Model,
+			int64(inputTokens),
+			int64(result.OutputTokens),
+			int64(cachedTokens),
+			result.TTFTMs,
+			result.TotalMs,
+			effort,
+		))
 	} else {
 		c.String(200, "data: [DONE]\n\n")
 	}

@@ -4,6 +4,7 @@ import (
 	"aurora/httpclient"
 	duckgotypes "aurora/typings/duckgo"
 	officialtypes "aurora/typings/official"
+	"aurora/util"
 	"bufio"
 	"bytes"
 	"crypto/rand"
@@ -313,7 +314,23 @@ func ReadResponseText(response *http.Response) string {
 	return previousText.String()
 }
 
-func Handler(c *gin.Context, response *http.Response, oldRequest duckgotypes.ApiRequest, stream bool) string {
+// HandlerStats carries pre-computed input stats and timing start into the stream handler.
+type HandlerStats struct {
+	Start        time.Time
+	PromptTokens int
+	CachedTokens int
+	Effort       string
+}
+
+// StreamResult is what Handler returns: the full text plus output-side telemetry.
+type StreamResult struct {
+	Text         string
+	OutputTokens int
+	TTFTMs       int64
+	TotalMs      int64
+}
+
+func Handler(c *gin.Context, response *http.Response, oldRequest duckgotypes.ApiRequest, stream bool, stats HandlerStats) StreamResult {
 	reader := bufio.NewReader(response.Body)
 	if stream {
 		// Response content type is text/event-stream
@@ -324,13 +341,15 @@ func Handler(c *gin.Context, response *http.Response, oldRequest duckgotypes.Api
 	}
 
 	var previousText strings.Builder
+	var firstTokenSet bool
+	var ttftMs int64
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return ""
+			return StreamResult{}
 		}
 		if len(line) < 6 {
 			continue
@@ -344,11 +363,15 @@ func Handler(c *gin.Context, response *http.Response, oldRequest duckgotypes.Api
 			}
 			if originalResponse.Action != "success" {
 				c.JSON(500, gin.H{"error": "Error"})
-				return ""
+				return StreamResult{}
 			}
 			responseString := ""
 			if originalResponse.Message != "" {
 				previousText.WriteString(originalResponse.Message)
+				if !firstTokenSet {
+					firstTokenSet = true
+					ttftMs = time.Since(stats.Start).Milliseconds()
+				}
 				translatedResponse := officialtypes.NewChatCompletionChunkWithModel(originalResponse.Message, originalResponse.Model)
 				responseString = "data: " + translatedResponse.String() + "\n\n"
 			}
@@ -360,7 +383,7 @@ func Handler(c *gin.Context, response *http.Response, oldRequest duckgotypes.Api
 			if stream {
 				_, err = c.Writer.WriteString(responseString)
 				if err != nil {
-					return ""
+					return StreamResult{}
 				}
 				c.Writer.Flush()
 			}
@@ -371,5 +394,30 @@ func Handler(c *gin.Context, response *http.Response, oldRequest duckgotypes.Api
 			}
 		}
 	}
-	return previousText.String()
+
+	fullText := previousText.String()
+	outputTokens := util.CountToken(fullText)
+	totalMs := time.Since(stats.Start).Milliseconds()
+
+	// Emit the final usage + timing chunk after [DONE] in stream mode (OpenAI include_usage compatible).
+	if stream {
+		usageChunk := officialtypes.UsageChunk(
+			oldRequest.Model,
+			stats.PromptTokens,
+			outputTokens,
+			stats.CachedTokens,
+			ttftMs,
+			totalMs,
+			stats.Effort,
+		)
+		c.Writer.WriteString("data: " + usageChunk.String() + "\n\n")
+		c.Writer.Flush()
+	}
+
+	return StreamResult{
+		Text:         fullText,
+		OutputTokens: outputTokens,
+		TTFTMs:       ttftMs,
+		TotalMs:      totalMs,
+	}
 }

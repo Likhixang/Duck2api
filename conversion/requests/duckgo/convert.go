@@ -22,11 +22,13 @@ import (
 
 func capReasoningEffort(model string, effort string) string {
 	effort = strings.ToLower(strings.TrimSpace(effort))
+	// DuckDuckGo only supports two reasoning states: "none" (fast) and "low" (reasoning mode).
+	// Any explicit effort level entered by the user enables reasoning mode.
 	switch effort {
-	case "high", "max", "xhigh":
-		return "low"
-	default:
+	case "", "none":
 		return "none"
+	default:
+		return "low"
 	}
 }
 

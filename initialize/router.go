@@ -44,11 +44,13 @@ func registerRoutes(group *gin.RouterGroup, handler *Handler) {
 	group.OPTIONS("/v1/chat/completions", optionsHandler)
 	group.POST("/v1/chat/completions", middlewares.Authorization, handler.duckduckgo)
 
+	// Anthropic Messages API (Claude Code native protocol)
+	group.OPTIONS("/v1/messages", optionsHandler)
+	group.POST("/v1/messages", middlewares.Authorization, handler.messagesHandler)
+
 	// Responses API
 	group.OPTIONS("/v1/responses", optionsHandler)
-	group.OPTIONS("/v1/response", optionsHandler)
 	group.POST("/v1/responses", middlewares.Authorization, handler.responses)
-	group.POST("/v1/response", middlewares.Authorization, handler.responses)
 
 	// Images
 	group.OPTIONS("/v1/images/generations", optionsHandler)

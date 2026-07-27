@@ -29,6 +29,7 @@ type ResponseAPIRequest struct {
 	MaxOutputTokens    int         `json:"max_output_tokens"`
 	Tools              interface{} `json:"tools"`
 	ToolChoice         interface{} `json:"tool_choice"`
+	ReasoningEffort    string      `json:"reasoning_effort,omitempty"`
 }
 
 func (r ResponseAPIRequest) ToChatCompletionRequest() APIRequest {

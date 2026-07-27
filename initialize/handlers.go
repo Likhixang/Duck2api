@@ -7,11 +7,16 @@ import (
 	"aurora/internal/proxys"
 	duckgotypes "aurora/typings/duckgo"
 	officialtypes "aurora/typings/official"
+	"aurora/util"
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -55,6 +60,20 @@ func (h *Handler) duckduckgo(c *gin.Context) {
 		}})
 		return
 	}
+
+	// Resolve thinking effort: request field takes precedence, then CLAUDE_CODE_EFFORT_LEVEL env.
+	effort := original_request.ReasoningEffort
+	if effort == "" {
+		effort = os.Getenv("CLAUDE_CODE_EFFORT_LEVEL")
+		original_request.ReasoningEffort = effort
+	}
+
+	// Input token counting + prompt-cache simulation (cache creation / hit).
+	inputTokens := util.CountMessagesTokens(original_request.Messages)
+	promptHash := util.HashPrompt(messagesText(original_request.Messages))
+	cacheCreation, cacheRead := util.RecordCache(promptHash, inputTokens)
+	cachedTokens := cacheRead // a cache hit is what gets reported in usage
+
 	translated_request, response, err := h.startDuckDuckGoRequest(original_request)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -75,15 +94,54 @@ func (h *Handler) duckduckgo(c *gin.Context) {
 		}})
 		return
 	}
-	response_part := duckgo.Handler(c, response, translated_request, original_request.Stream)
+
+	start := time.Now()
+	stats := duckgo.HandlerStats{
+		Start:        start,
+		PromptTokens: inputTokens,
+		CachedTokens: cachedTokens,
+		Effort:       effort,
+	}
+
+	// Cache breakdown is known before streaming starts, so set these headers
+	// before the first chunk is flushed (works for both stream and non-stream).
+	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
+	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+
+	result := duckgo.Handler(c, response, translated_request, original_request.Stream, stats)
+
+	// Timing is only known after the stream completes. For non-stream this header
+	// is delivered; for stream the same values are in the final usage chunk.
+	c.Header("X-TTFT-Ms", fmt.Sprintf("%d", result.TTFTMs))
+	c.Header("X-Total-Time-Ms", fmt.Sprintf("%d", result.TotalMs))
+
 	if c.Writer.Status() != 200 {
 		return
 	}
 	if !original_request.Stream {
-		c.JSON(200, officialtypes.NewChatCompletionWithModel(response_part, translated_request.Model))
+		c.JSON(200, officialtypes.NewChatCompletionFull(
+			result.Text,
+			translated_request.Model,
+			int64(inputTokens),
+			int64(result.OutputTokens),
+			int64(cachedTokens),
+			result.TTFTMs,
+			result.TotalMs,
+			effort,
+		))
 	} else {
 		c.String(200, "data: [DONE]\n\n")
 	}
+}
+
+// messagesText concatenates message contents into a single string for cache keying.
+func messagesText(messages []officialtypes.ApiMessage) string {
+	var sb strings.Builder
+	for _, msg := range messages {
+		sb.WriteString(util.MessageText(msg.Content))
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 func (h *Handler) responses(c *gin.Context) {
@@ -99,7 +157,22 @@ func (h *Handler) responses(c *gin.Context) {
 		return
 	}
 
+	// Resolve thinking effort: request field takes precedence, then CLAUDE_CODE_EFFORT_LEVEL env.
+	effort := responseRequest.ReasoningEffort
+	if effort == "" {
+		effort = os.Getenv("CLAUDE_CODE_EFFORT_LEVEL")
+		responseRequest.ReasoningEffort = effort
+	}
+
 	chatRequest := responseRequest.ToChatCompletionRequest()
+	chatRequest.ReasoningEffort = effort
+
+	// Input token counting + prompt-cache simulation.
+	inputTokens := util.CountMessagesTokens(chatRequest.Messages)
+	promptHash := util.HashPrompt(messagesText(chatRequest.Messages))
+	cacheCreation, cacheRead := util.RecordCache(promptHash, inputTokens)
+	cachedTokens := cacheRead
+
 	translatedRequest, response, err := h.startDuckDuckGoRequest(chatRequest)
 	if err != nil {
 		c.JSON(500, gin.H{
@@ -115,14 +188,39 @@ func (h *Handler) responses(c *gin.Context) {
 		return
 	}
 
-	responseText := duckgo.ReadResponseText(response)
+	// Cache breakdown is known before streaming; set before first flush.
+	c.Header("X-Cache-Creation-Tokens", fmt.Sprintf("%d", cacheCreation))
+	c.Header("X-Cache-Read-Tokens", fmt.Sprintf("%d", cacheRead))
+
+	start := time.Now()
+	stats := duckgo.HandlerStats{
+		Start:        start,
+		PromptTokens: inputTokens,
+		CachedTokens: cachedTokens,
+		Effort:       effort,
+	}
 
 	if responseRequest.Stream {
-		writeResponsesStream(c, responseText, translatedRequest.Model)
+		result := handleResponsesStream(c, response.Body, translatedRequest.Model, stats)
+		c.Header("X-TTFT-Ms", fmt.Sprintf("%d", result.ttftMs))
+		c.Header("X-Total-Time-Ms", fmt.Sprintf("%d", result.totalMs))
 		return
 	}
 
-	c.JSON(http.StatusOK, officialtypes.NewResponseAPIWithModel(responseText, translatedRequest.Model))
+	result := duckgo.Handler(c, response, translatedRequest, false, stats)
+	c.Header("X-TTFT-Ms", fmt.Sprintf("%d", result.TTFTMs))
+	c.Header("X-Total-Time-Ms", fmt.Sprintf("%d", result.TotalMs))
+
+	c.JSON(http.StatusOK, officialtypes.NewResponseAPIFull(
+		result.Text,
+		translatedRequest.Model,
+		int64(inputTokens),
+		int64(result.OutputTokens),
+		int64(cachedTokens),
+		result.TTFTMs,
+		result.TotalMs,
+		effort,
+	))
 }
 
 func (h *Handler) startDuckDuckGoRequest(originalRequest officialtypes.APIRequest) (duckgotypes.ApiRequest, *http.Response, error) {
@@ -156,14 +254,32 @@ func truncateStr(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func writeResponsesStream(c *gin.Context, text string, model string) {
+// responsesStreamResult holds output-side telemetry for a streamed response.
+type responsesStreamResult struct {
+	text         string
+	outputTokens int
+	ttftMs       int64
+	totalMs      int64
+}
+
+// handleResponsesStream reads DuckDuckGo's text SSE and emits real Response API
+// SSE events (response.created → output_item.added → content_part.added →
+// output_text.delta per token → output_text.done → content_part.done →
+// output_item.done → response.completed).
+func handleResponsesStream(c *gin.Context, body io.ReadCloser, model string, stats duckgo.HandlerStats) responsesStreamResult {
+	defer body.Close()
+
+	reader := bufio.NewReader(body)
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
-	response := officialtypes.NewResponseAPIWithModel("", model)
-	response.Status = "in_progress"
-	response.Output = []officialtypes.ResponseOutput{}
+	// Pre-build the response shells.
+	inProgress := officialtypes.NewResponseAPIWithModel("", model)
+	inProgress.Status = "in_progress"
+	inProgress.Output = []officialtypes.ResponseOutput{}
+	inProgress.Usage = officialtypes.ResponseUsage{InputTokens: stats.PromptTokens}
+
 	output := officialtypes.NewResponseOutput("")
 	output.Status = "in_progress"
 	part := officialtypes.ResponseOutputContent{
@@ -171,31 +287,95 @@ func writeResponsesStream(c *gin.Context, text string, model string) {
 		Text:        "",
 		Annotations: []interface{}{},
 	}
+
+	// response.created
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.created", Sequence: 1, Response: &inProgress})
+	// response.output_item.added
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.output_item.added", Sequence: 2, OutputIndex: 0, Item: &output})
+	// response.content_part.added
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.content_part.added", Sequence: 3, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Part: part})
+
+	var sb strings.Builder
+	var firstTokenSet bool
+	var ttftMs int64
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return responsesStreamResult{}
+		}
+		if len(line) < 6 {
+			continue
+		}
+		line = line[6:] // strip "data: "
+		if strings.HasPrefix(line, "[DONE]") {
+			continue
+		}
+
+		var delta struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(line), &delta); err != nil {
+			continue
+		}
+		if delta.Message == "" {
+			continue
+		}
+
+		sb.WriteString(delta.Message)
+		if !firstTokenSet {
+			firstTokenSet = true
+			ttftMs = time.Since(stats.Start).Milliseconds()
+		}
+
+		// response.output_text.delta
+		writeRespEvent(c, officialtypes.ResponseStreamEvent{
+			Type:         "response.output_text.delta",
+			Sequence:     0,
+			ItemID:       output.ID,
+			OutputIndex:  0,
+			ContentIndex: 0,
+			Delta:        delta.Message,
+		})
+	}
+
+	fullText := sb.String()
+	outputTokens := util.CountToken(fullText)
+	totalMs := time.Since(stats.Start).Milliseconds()
+
 	donePart := officialtypes.ResponseOutputContent{
 		Type:        "output_text",
-		Text:        text,
+		Text:        fullText,
 		Annotations: []interface{}{},
 	}
-	events := []officialtypes.ResponseStreamEvent{
-		{Type: "response.created", Sequence: 1, Response: &response},
-		{Type: "response.output_item.added", Sequence: 2, OutputIndex: 0, Item: &output},
-		{Type: "response.content_part.added", Sequence: 3, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Part: part},
-		{Type: "response.output_text.delta", Sequence: 4, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Delta: text},
-		{Type: "response.output_text.done", Sequence: 5, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Text: text},
-		{Type: "response.content_part.done", Sequence: 6, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Part: donePart},
-	}
+	completed := officialtypes.NewResponseAPIFull(fullText, model, int64(stats.PromptTokens), int64(outputTokens), int64(stats.CachedTokens), ttftMs, totalMs, stats.Effort)
 
-	completed := officialtypes.NewResponseAPIWithModel(text, model)
-	events = append(events,
-		officialtypes.ResponseStreamEvent{Type: "response.output_item.done", Sequence: 7, OutputIndex: 0, Item: &completed.Output[0]},
-		officialtypes.ResponseStreamEvent{Type: "response.completed", Sequence: 8, Response: &completed},
-	)
+	// response.output_text.done
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.output_text.done", Sequence: 0, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Text: fullText})
+	// response.content_part.done
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.content_part.done", Sequence: 0, ItemID: output.ID, OutputIndex: 0, ContentIndex: 0, Part: donePart})
+	// response.output_item.done
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.output_item.done", Sequence: 0, OutputIndex: 0, Item: &completed.Output[0]})
+	// response.completed
+	writeRespEvent(c, officialtypes.ResponseStreamEvent{Type: "response.completed", Sequence: 0, Response: &completed})
+	c.Writer.Flush()
 
-	for _, event := range events {
-		c.Writer.WriteString("event: " + event.Type + "\n")
-		c.Writer.WriteString("data: " + event.String() + "\n\n")
-		c.Writer.Flush()
+	return responsesStreamResult{
+		text:         fullText,
+		outputTokens: outputTokens,
+		ttftMs:       ttftMs,
+		totalMs:      totalMs,
 	}
+}
+
+// writeRespEvent serializes a Response API SSE event and writes it to the client.
+func writeRespEvent(c *gin.Context, event officialtypes.ResponseStreamEvent) {
+	c.Writer.WriteString("event: " + event.Type + "\n")
+	c.Writer.WriteString("data: " + event.String() + "\n\n")
+	c.Writer.Flush()
 }
 
 func (h *Handler) imageGenerations(c *gin.Context) {
