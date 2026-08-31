@@ -421,10 +421,7 @@ func (h *Handler) imageGenerations(c *gin.Context) {
 	}
 
 	// Build a chat request with image generation enabled
-	model := req.Model
-	if model == "" {
-		model = "gpt-5.4-nano"
-	}
+	model := resolveChatModel(req.Model)
 
 	chatReq := officialtypes.APIRequest{
 		Model: model,
@@ -532,10 +529,7 @@ func (h *Handler) imageEdits(c *gin.Context) {
 		return
 	}
 
-	model := c.Request.FormValue("model")
-	if model == "" {
-		model = "gpt-5.4-nano"
-	}
+	model := resolveChatModel(c.Request.FormValue("model"))
 
 	// Read image file
 	file, _, err := c.Request.FormFile("image")
@@ -585,10 +579,7 @@ func (h *Handler) handleImageEditJSON(c *gin.Context, req officialtypes.ImageEdi
 		return
 	}
 
-	model := req.Model
-	if model == "" {
-		model = "gpt-5.4-nano"
-	}
+	model := resolveChatModel(req.Model)
 
 	h.doImageEdit(c, req.Prompt, model, req.Image, req.ReasoningEffort)
 }
@@ -703,6 +694,28 @@ var fallbackModelIDs = []string{
 	"tinfoil/gemma4-31b",
 }
 
+// 图像生成模型：duck.ai 后端实际使用 GPT Image 2 画图，
+// 但官方 /v1/models 接口不返回图像模型，这里手动暴露，
+// 实际请求仍走 GenerateImage tool（由聊天模型触发）。
+var imageModelIDs = []string{
+	"gpt-image-2",
+}
+
+// resolveChatModel 将图像模型 ID 映射为可用的聊天模型，
+// 因为 duck.ai 图像生成走 GenerateImage tool，由聊天模型触发，
+// 不能直接把 gpt-image-2 等图像模型 ID 传给聊天接口。
+func resolveChatModel(model string) string {
+	if model == "" {
+		return "gpt-5.4-nano"
+	}
+	for _, imgID := range imageModelIDs {
+		if model == imgID {
+			return "gpt-5.4-nano"
+		}
+	}
+	return model
+}
+
 func (h *Handler) engines(c *gin.Context) {
 	modelS := JSONData{
 		Object: "list",
@@ -726,6 +739,11 @@ func (h *Handler) getModels() []ResData {
 		for _, id := range fallbackModelIDs {
 			list = append(list, ResData{ID: id, Object: "model", Created: 1685474247, OwnedBy: "duckduckgo"})
 		}
+	}
+
+	// 追加图像生成模型（官方接口不返回，手动暴露）
+	for _, id := range imageModelIDs {
+		list = append(list, ResData{ID: id, Object: "model", Created: 1685474247, OwnedBy: "openai"})
 	}
 
 	modelListCache = list
