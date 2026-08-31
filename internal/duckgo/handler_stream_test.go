@@ -48,6 +48,85 @@ func (m *mockWriter) CloseNotify() <-chan bool {
 	return nil
 }
 
+// TestReadImageResponse_PrioritizeTool verifies that when both a legacy parts
+// image and a GenerateImage tool image are present, only the tool image is returned.
+func TestReadImageResponse_PrioritizeTool(t *testing.T) {
+	partsImage := `{"action":"success","model":"gpt-5.4-nano","role":"assistant","message":"Here is your image","parts":[{"type":"generated-image","result":"AAAA"}]}`
+	toolImage := `{"action":"success","model":"gpt-5.4-nano","role":"assistant","toolName":"GenerateImage","data":{"b64Image":"BBBB","format":"png"}}`
+
+	sse := "data: " + partsImage + "\n" +
+		"data: " + toolImage + "\n" +
+		"data: [DONE]\n"
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{},
+		Body:       fakeCloser{Buffer: bytes.NewBufferString(sse)},
+	}
+
+	result := ReadImageResponse(resp)
+
+	if len(result.Images) != 1 {
+		t.Fatalf("expected 1 image (tool), got %d", len(result.Images))
+	}
+	if result.Images[0].Result != "BBBB" {
+		t.Fatalf("expected tool image BBBB, got %q", result.Images[0].Result)
+	}
+	if result.Text != "Here is your image" {
+		t.Fatalf("expected text 'Here is your image', got %q", result.Text)
+	}
+}
+
+// TestReadImageResponse_FallbackToParts verifies that when no tool image is present,
+// legacy parts images are still returned as fallback.
+func TestReadImageResponse_FallbackToParts(t *testing.T) {
+	partsImage := `{"action":"success","model":"gpt-5.4-nano","role":"assistant","parts":[{"type":"generated-image","result":"CCCC"}]}`
+
+	sse := "data: " + partsImage + "\n" +
+		"data: [DONE]\n"
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{},
+		Body:       fakeCloser{Buffer: bytes.NewBufferString(sse)},
+	}
+
+	result := ReadImageResponse(resp)
+
+	if len(result.Images) != 1 {
+		t.Fatalf("expected 1 image (fallback), got %d", len(result.Images))
+	}
+	if result.Images[0].Result != "CCCC" {
+		t.Fatalf("expected fallback image CCCC, got %q", result.Images[0].Result)
+	}
+}
+
+// TestReadImageResponse_MultipleToolImages verifies that multi-tool-image SSE
+// returns all tool images without dropping any.
+func TestReadImageResponse_MultipleToolImages(t *testing.T) {
+	tool1 := `{"action":"success","model":"gpt-5.4-nano","toolName":"GenerateImage","data":{"b64Image":"DDDD","format":"png"}}`
+	tool2 := `{"action":"success","model":"gpt-5.4-nano","toolName":"GenerateImage","data":{"b64Image":"EEEE","format":"jpg"}}`
+
+	sse := "data: " + tool1 + "\n" +
+		"data: " + tool2 + "\n" +
+		"data: [DONE]\n"
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{},
+		Body:       fakeCloser{Buffer: bytes.NewBufferString(sse)},
+	}
+
+	result := ReadImageResponse(resp)
+
+	if len(result.Images) != 2 {
+		t.Fatalf("expected 2 tool images, got %d", len(result.Images))
+	}
+	if result.Images[0].Result != "DDDD" || result.Images[1].Result != "EEEE" {
+		t.Fatalf("unexpected images: %+v", result.Images)
+	}
+}
+
 // TestHandlerStreamUsage verifies the SSE output: content chunks, the [DONE] stop
 // chunk, and the final usage+timing chunk emitted after it.
 func TestHandlerStreamUsage(t *testing.T) {

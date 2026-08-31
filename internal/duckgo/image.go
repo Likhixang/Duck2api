@@ -20,6 +20,7 @@ func ReadImageResponse(response *http.Response) ImageResult {
 	reader := bufio.NewReader(response.Body)
 	var textBuilder strings.Builder
 	var images []duckgotypes.ImagePart
+	var hasToolImage bool
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -48,16 +49,14 @@ func ReadImageResponse(response *http.Response) ImageResult {
 			textBuilder.WriteString(apiResp.Message)
 		}
 
-		// Extract image from parts (legacy format)
-		for _, part := range apiResp.Parts {
-			if part.Type == "generated-image" || part.Type == "image" {
-				images = append(images, part)
-			}
-		}
-
-		// Extract image from data field (new format: ui-component with GenerateImage)
+		// Extract image from data field (GenerateImage tool — real GPT Image 2 output)
+		// This is the authoritative source: if present, ignore legacy parts.
 		if apiResp.ToolName == "GenerateImage" && apiResp.Data != nil {
 			if imgData := apiResp.GetImageData(); imgData != nil && imgData.B64Image != "" {
+				if !hasToolImage {
+					// First tool image: clear any preview images from chat model parts
+					images = nil
+				}
 				images = append(images, duckgotypes.ImagePart{
 					Type:   "generated-image",
 					Result: imgData.B64Image,
@@ -65,6 +64,17 @@ func ReadImageResponse(response *http.Response) ImageResult {
 					Width:  imgData.Width,
 					Height: imgData.Height,
 				})
+				hasToolImage = true
+			}
+		}
+
+		// Extract image from parts (legacy format — chat model's own preview)
+		// Only use as fallback when no GenerateImage tool data was found.
+		if !hasToolImage {
+			for _, part := range apiResp.Parts {
+				if part.Type == "generated-image" || part.Type == "image" {
+					images = append(images, part)
+				}
 			}
 		}
 	}
