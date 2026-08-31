@@ -101,6 +101,32 @@ func TestReadImageResponse_FallbackToParts(t *testing.T) {
 	}
 }
 
+// TestReadImageResponse_SkipPartial verifies that partial-status tool images
+// (progressive previews) are skipped, keeping only the final success image.
+func TestReadImageResponse_SkipPartial(t *testing.T) {
+	partial := `{"action":"success","model":"gpt-5.4-nano","toolName":"GenerateImage","data":{"b64Image":"PPPP","format":"jpeg","status":"partial"}}`
+	final := `{"action":"success","model":"gpt-5.4-nano","toolName":"GenerateImage","data":{"b64Image":"FFFF","format":"jpeg","status":"success"}}`
+
+	sse := "data: " + partial + "\n" +
+		"data: " + final + "\n" +
+		"data: [DONE]\n"
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{},
+		Body:       fakeCloser{Buffer: bytes.NewBufferString(sse)},
+	}
+
+	result := ReadImageResponse(resp)
+
+	if len(result.Images) != 1 {
+		t.Fatalf("expected 1 image (final success), got %d", len(result.Images))
+	}
+	if result.Images[0].Result != "FFFF" {
+		t.Fatalf("expected final image FFFF, got %q", result.Images[0].Result)
+	}
+}
+
 // TestReadImageResponse_MultipleToolImages verifies that multi-tool-image SSE
 // returns all tool images without dropping any.
 func TestReadImageResponse_MultipleToolImages(t *testing.T) {

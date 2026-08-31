@@ -50,9 +50,11 @@ func ReadImageResponse(response *http.Response) ImageResult {
 		}
 
 		// Extract image from data field (GenerateImage tool — real GPT Image 2 output)
-		// This is the authoritative source: if present, ignore legacy parts.
+		// Only accept final "success" images; "partial" events are intermediate
+		// previews (progressive rendering) and must be skipped.
 		if apiResp.ToolName == "GenerateImage" && apiResp.Data != nil {
-			if imgData := apiResp.GetImageData(); imgData != nil && imgData.B64Image != "" {
+			if imgData := apiResp.GetImageData(); imgData != nil && imgData.B64Image != "" &&
+				(imgData.Status == "" || imgData.Status == "success") {
 				if !hasToolImage {
 					// First tool image: clear any preview images from chat model parts
 					images = nil
